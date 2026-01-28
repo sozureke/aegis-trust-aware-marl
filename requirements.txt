@@ -1,0 +1,15 @@
+# Core dependencies
+gymnasium>=0.29.0
+pettingzoo>=1.24.0
+supersuit>=3.9.0
+networkx>=3.0
+numpy>=1.24.0
+
+# Training
+torch>=2.0.0
+
+# Configuration
+pyyaml>=6.0
+
+# Optional logging
+wandb>=0.16.0  # Optional: only if use_wandb=true in config
