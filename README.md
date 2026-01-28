@@ -18,7 +18,6 @@ A production-quality multi-agent reinforcement learning project implementing a c
 
 ```bash
 # Install in development mode
-cd aegis
 pip install -e .
 ```
 
