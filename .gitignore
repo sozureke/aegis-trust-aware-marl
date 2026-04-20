@@ -155,3 +155,8 @@ results/
 # Local development
 .cursor/
 
+# Next.js — AEGIS web player
+player/node_modules/
+player/.next/
+player/out/
+
