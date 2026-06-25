@@ -9,6 +9,7 @@ from typing import Optional, Any
 
 class EventType(str, Enum):
     """Event type enum."""
+    EPISODE_START = "episode_start"
     TICK_START = "tick_start"
     TICK_END = "tick_end"
     PHASE_CHANGE = "phase_change"
@@ -31,7 +32,14 @@ class EventType(str, Enum):
     EVAC_PROGRESS = "evac_progress"
     WIN = "win"
     KNOWER_REVEAL = "knower_reveal"
+    ROLE_ASSIGNMENT = "role_assignment"
+    TASK_ASSIGNMENT = "task_assignment"
     MEETING_SUMMARY = "meeting_summary"
+    VOTE_RESOLUTION = "vote_resolution"
+    POSE = "pose"
+    ROOM_ENTER = "room_enter"
+    ROOM_EXIT = "room_exit"
+    MOVE_BLOCKED = "move_blocked"
 
 
 @dataclass
@@ -93,8 +101,14 @@ def door_open_event(tick: int, edge: tuple[int, int]) -> Event:
     return make_event(EventType.DOOR_OPEN, tick, edge=list(edge))
 
 
-def task_progress_event(tick: int, agent_id: int, task_idx: int, step: int, progress: int) -> Event:
-    return make_event(EventType.TASK_PROGRESS, tick, agent_id=agent_id, task_idx=task_idx, step=step, progress=progress)
+def task_progress_event(tick: int, agent_id: int, task_idx: int, step: int, progress: int, progress_max: int = 0) -> Event:
+    """Log task progress.
+
+    Args:
+        progress: Ticks accumulated in current step.
+        progress_max: Ticks required to complete this step (enables % computation by the player).
+    """
+    return make_event(EventType.TASK_PROGRESS, tick, agent_id=agent_id, task_idx=task_idx, step=step, progress=progress, progress_max=progress_max)
 
 
 def task_step_complete_event(tick: int, agent_id: int, task_idx: int, step: int) -> Event:
@@ -183,6 +197,59 @@ def knower_reveal_event(tick: int, knower_id: int, target_id: int, target_role: 
     return make_event(EventType.KNOWER_REVEAL, tick, knower_id=knower_id, target_id=target_id, target_role=target_role)
 
 
+def role_assignment_event(tick: int, roles: list[int]) -> Event:
+    """Ground-truth crew (0) / impostor (1) for every agent index; logged once at episode start."""
+    return make_event(EventType.ROLE_ASSIGNMENT, tick, roles=roles)
+
+
+def pose_event(
+    tick: int,
+    agent_id: int,
+    room: int,
+    x: float,
+    y: float,
+    theta: float,
+    env_step: Optional[int] = None,
+) -> Event:
+    data: dict = {
+        "agent_id": agent_id,
+        "room": room,
+        "x": x,
+        "y": y,
+        "theta": theta,
+    }
+    if env_step is not None:
+        data["env_step"] = env_step
+    return make_event(EventType.POSE, tick, **data)
+
+
+def room_exit_event(tick: int, agent_id: int, room: int) -> Event:
+    return make_event(EventType.ROOM_EXIT, tick, agent_id=agent_id, room=room)
+
+
+def room_enter_event(tick: int, agent_id: int, room: int) -> Event:
+    return make_event(EventType.ROOM_ENTER, tick, agent_id=agent_id, room=room)
+
+
+def move_blocked_event(
+    tick: int,
+    agent_id: int,
+    reason: str,
+    from_room: int,
+    to_room: int,
+    edge: Optional[list[int]] = None,
+) -> Event:
+    d = {
+        "agent_id": agent_id,
+        "reason": reason,
+        "from_room": from_room,
+        "to_room": to_room,
+    }
+    if edge is not None:
+        d["edge"] = edge
+    return make_event(EventType.MOVE_BLOCKED, tick, **d)
+
+
 def meeting_summary_event(
     tick: int,
     meeting_tick_start: int,
@@ -192,13 +259,14 @@ def meeting_summary_event(
     votes: dict[int, Optional[int]],
     ejected_id: Optional[int] = None,
     ejected_role: Optional[int] = None,
+    body_agent_id: Optional[int] = None,
 ) -> Event:
     """
     Create a meeting summary event with all communications and voting results.
-    
+
     Useful for scientific analysis: shows complete meeting context, all communications,
     and final outcome in one event.
-    
+
     Args:
         tick: Current tick (end of meeting)
         meeting_tick_start: Tick when meeting started
@@ -208,10 +276,9 @@ def meeting_summary_event(
         votes: Final votes cast (voter_id -> target_id or None)
         ejected_id: Agent who was ejected (if any)
         ejected_role: Role of ejected agent (0=survivor, 1=impostor, if applicable)
+        body_agent_id: Agent ID of the dead body that triggered the meeting (for full traceability)
     """
-    return make_event(
-        EventType.MEETING_SUMMARY,
-        tick,
+    data: dict = dict(
         meeting_tick_start=meeting_tick_start,
         reporter_id=reporter_id,
         body_room=body_room,
@@ -219,5 +286,83 @@ def meeting_summary_event(
         votes=votes,
         ejected_id=ejected_id,
         ejected_role=ejected_role,
+    )
+    if body_agent_id is not None:
+        data["body_agent_id"] = body_agent_id
+    return make_event(EventType.MEETING_SUMMARY, tick, **data)
+
+
+def episode_start_event(
+    tick: int,
+    seed: int,
+    num_agents: int,
+    num_survivors: int,
+    num_impostors: int,
+    num_rooms: int,
+    evac_room: int,
+    max_ticks: int,
+) -> Event:
+    """Metadata event emitted once at the very start of each episode (before role_assignment).
+
+    Allows the player to display experiment context without needing an external config file.
+    All values needed to fully interpret the log are included here.
+    """
+    return make_event(
+        EventType.EPISODE_START,
+        tick,
+        seed=seed,
+        num_agents=num_agents,
+        num_survivors=num_survivors,
+        num_impostors=num_impostors,
+        num_rooms=num_rooms,
+        evac_room=evac_room,
+        max_ticks=max_ticks,
+    )
+
+
+def task_assignment_event(
+    tick: int,
+    agent_id: int,
+    tasks: list[dict],
+) -> Event:
+    """Ground-truth task layout for a survivor, emitted once at tick 0.
+
+    Each element of `tasks` is a dict:
+      { task_idx, task_type, rooms: list[int], ticks_required: list[int] }
+
+    Allows the player to show which rooms each survivor is targeting and
+    to understand movement patterns relative to task objectives.
+    """
+    return make_event(EventType.TASK_ASSIGNMENT, tick, agent_id=agent_id, tasks=tasks)
+
+
+def vote_resolution_event(
+    tick: int,
+    suspicion_scores: dict[int, float],
+    accuse_counts: dict[int, int],
+    eligible_candidates: list[int],
+    has_coordination: bool,
+    voting_noise: float,
+    ejected_id: Optional[int],
+) -> Event:
+    """Environment-internal vote resolution record, emitted just before meeting_summary.
+
+    Captures the full probabilistic ejection mechanism so it is fully auditable:
+    - suspicion_scores: composite score (suspicion + trust) per alive agent at vote time
+    - accuse_counts: ACCUSE actions received by each agent during this meeting
+    - eligible_candidates: agents whose score was >= confidence_threshold
+    - has_coordination: whether accuse_counts met voting_coordination_threshold
+    - voting_noise: noise magnitude used in probabilistic selection
+    - ejected_id: agent selected for ejection (None if confidence gate failed)
+    """
+    return make_event(
+        EventType.VOTE_RESOLUTION,
+        tick,
+        suspicion_scores={str(k): round(v, 4) for k, v in suspicion_scores.items()},
+        accuse_counts={str(k): v for k, v in accuse_counts.items()},
+        eligible_candidates=eligible_candidates,
+        has_coordination=has_coordination,
+        voting_noise=round(voting_noise, 4),
+        ejected_id=ejected_id,
     )
 

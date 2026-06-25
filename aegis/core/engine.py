@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Optional
+import math
 import random
 import networkx as nx
 
@@ -42,6 +43,14 @@ from aegis.core.events import (
     evac_progress_event,
     win_event,
     knower_reveal_event,
+    pose_event,
+    role_assignment_event,
+    episode_start_event,
+    task_assignment_event,
+    vote_resolution_event,
+    room_exit_event,
+    room_enter_event,
+    move_blocked_event,
 )
 
 
@@ -87,7 +96,8 @@ class StepEngine:
         n_agents = self.config.num_agents
         n_doors = len(self.edges)
         n_tokens = 20
-        n_comm_actions = 17
+        from aegis.comms.actions import CommVocab as _CV
+        n_comm_actions = _CV.VOCAB_SIZE
         
         self.offset_move = 0
         self.offset_work = n_rooms
@@ -100,6 +110,30 @@ class StepEngine:
         self.offset_vote_skip = n_rooms + 2 + n_agents + n_doors + n_tokens + n_comm_actions + n_agents
         self.action_space_size = self.offset_vote_skip + 1
     
+    def describe_action(self, action: int) -> str:
+        action_type, param = self.parse_action(action)
+        if action_type == "move":
+            return f"move_to_room_{param}"
+        if action_type == "work":
+            return "work"
+        if action_type == "report":
+            return "report"
+        if action_type == "kill":
+            return f"kill_{param}"
+        if action_type == "close_door":
+            return f"close_door_{param}"
+        if action_type == "send_token":
+            return f"send_token_{param}"
+        if action_type == "comm_action":
+            return f"comm_{param}"
+        if action_type == "vote":
+            return f"vote_{param}"
+        if action_type == "vote_skip":
+            return "vote_skip"
+        if action_type == "noop":
+            return "noop"
+        return f"{action_type}_{param}"
+
     def parse_action(self, action: int) -> tuple[str, int]:
         """Parse action integer into (action_type, param)."""
         if action < self.offset_work:
@@ -152,31 +186,65 @@ class StepEngine:
             self._rng = random.Random(seed)
         
         events = []
-        
+
+        # Episode-level metadata: emitted first so the player can display context
+        # even before role information arrives.
+        events.append(episode_start_event(
+            tick=0,
+            seed=seed if seed is not None else (self.config.seed or 0),
+            num_agents=self.config.num_agents,
+            num_survivors=self.config.num_agents - self.config.num_impostors,
+            num_impostors=self.config.num_impostors,
+            num_rooms=len(self.rooms),
+            evac_room=self.config.evac_room,
+            max_ticks=self.config.max_ticks,
+        ))
 
         agent_ids = list(range(self.config.num_agents))
         self._rng.shuffle(agent_ids)
         impostor_ids = set(agent_ids[:self.config.num_impostors])
-        
+
 
         agents = {}
         for i in range(self.config.num_agents):
             role = Role.IMPOSTOR if i in impostor_ids else Role.SURVIVOR
-            room = self._rng.choice(self.rooms)
-            
+            spawn_pool = [r for r in self.rooms if r != self.config.evac_room]
+            if not spawn_pool:
+                spawn_pool = list(self.rooms)
+            room = self._rng.choice(spawn_pool)
+
             agent = AgentState(
                 agent_id=i,
                 role=role,
                 room=room,
                 kill_cooldown=self.config.kill_cooldown if role == Role.IMPOSTOR else 0,
             )
-            
+
 
             if role == Role.SURVIVOR:
                 agent.tasks = self._generate_tasks()
-            
+
             agents[i] = agent
-        
+
+
+        # Record full role roster once at tick 0 for replay / visualization (ordering: agent id 0..n-1).
+        role_snapshot = [int(agents[j].role) for j in range(self.config.num_agents)]
+        events.append(role_assignment_event(0, role_snapshot))
+
+        # Log task assignments for every survivor so the player can show which rooms
+        # each agent is targeting. Without this, movement patterns are opaque.
+        for agent_id, agent in agents.items():
+            if agent.role == Role.SURVIVOR and agent.tasks:
+                task_dicts = [
+                    {
+                        "task_idx": idx,
+                        "task_type": int(task.task_type),
+                        "rooms": list(task.rooms),
+                        "ticks_required": list(task.ticks_required),
+                    }
+                    for idx, task in enumerate(agent.tasks)
+                ]
+                events.append(task_assignment_event(0, agent_id, task_dicts))
 
         if self.config.enable_knower:
             knower_id = self._rng.choice(agent_ids)
@@ -206,6 +274,8 @@ class StepEngine:
             evac_room=self.config.evac_room,
             config=self.config,
         )
+        self._sync_agent_poses(world)
+        events.extend(self._pose_events(world))
         
         return world, events
     
@@ -318,10 +388,16 @@ class StepEngine:
             suspicion_scores: Optional dict mapping agent_id -> suspicion score [0.0, 1.0]
                             Used for probabilistic ejection selection
         """
+        # Guard: no events should be emitted after the game has already ended.
+        # The RL environment may call step() once more after detecting termination;
+        # this prevents stale pose/move events from polluting the log.
+        if world.terminated or world.truncated:
+            return world, []
+
         next_world = world.copy()
         next_world.tick += 1
         events = []
-        
+
 
         events.extend(self._decrement_timers(next_world))
         
@@ -375,6 +451,9 @@ class StepEngine:
         
 
         events.extend(self._check_win_conditions(next_world))
+
+        self._sync_agent_poses(next_world)
+        events.extend(self._pose_events(next_world))
         
         return next_world, events
     
@@ -395,6 +474,58 @@ class StepEngine:
                     events.append(door_open_event(world.tick, edge))
         
         return events
+
+    def _grid_side(self) -> int:
+        n = len(self.rooms)
+        s = int(round(n ** 0.5))
+        return s if s * s == n and s > 0 else 3
+
+    def _sync_agent_poses(self, world: WorldState) -> None:
+        cols = self._grid_side()
+        for agent in world.agents.values():
+            if not agent.alive:
+                continue
+            r = agent.room
+            col = r % cols
+            row = r // cols
+            cx, cy = 0.5, 0.5
+            th = 0.0
+            if agent.path and len(agent.path) > 0:
+                nxt = agent.path[0]
+                ncol = nxt % cols
+                nrow = nxt // cols
+                dcol = ncol - col
+                drow = nrow - row
+                w = 1.0 / (1.0 + float(len(agent.path)))
+                cx = max(0.05, min(0.95, 0.5 + 0.45 * float(dcol) * w))
+                cy = max(0.05, min(0.95, 0.5 + 0.45 * float(drow) * w))
+                th = math.atan2(float(drow), float(dcol)) if (dcol != 0 or drow != 0) else 0.0
+            else:
+                t = world.tick * 0.15 + float(agent.agent_id) * 0.9
+                cx = max(0.1, min(0.9, 0.5 + 0.25 * math.sin(t)))
+                cy = max(0.1, min(0.9, 0.5 + 0.25 * math.cos(t * 0.85)))
+                th = t % (2.0 * math.pi)
+            agent.pose_x = float(cx)
+            agent.pose_y = float(cy)
+            agent.pose_theta = float(th)
+
+    def _pose_events(self, world: WorldState) -> list[Event]:
+        out: list[Event] = []
+        for aid, agent in sorted(world.agents.items()):
+            if not agent.alive:
+                continue
+            out.append(
+                pose_event(
+                    world.tick,
+                    aid,
+                    agent.room,
+                    agent.pose_x,
+                    agent.pose_y,
+                    agent.pose_theta,
+                    env_step=world.tick,
+                )
+            )
+        return out
     
     def _apply_movement(self, world: WorldState, joint_actions: dict[int, int]) -> list[Event]:
         """Apply movement actions."""
@@ -428,7 +559,20 @@ class StepEngine:
                         old_room = agent.room
                         agent.room = next_room
                         agent.path = agent.path[1:]
+                        events.append(room_exit_event(world.tick, agent_id, old_room))
+                        events.append(room_enter_event(world.tick, agent_id, next_room))
                         events.append(move_event(world.tick, agent_id, old_room, next_room))
+                    else:
+                        events.append(
+                            move_blocked_event(
+                                world.tick,
+                                agent_id,
+                                "door_closed",
+                                agent.room,
+                                next_room,
+                                edge=list(edge),
+                            )
+                        )
         
         return events
     
@@ -539,7 +683,8 @@ class StepEngine:
 
                         task.progress += 1
                         events.append(task_progress_event(
-                            world.tick, agent_id, task_idx, task.current_step, task.progress
+                            world.tick, agent_id, task_idx, task.current_step, task.progress,
+                            progress_max=task.ticks_required[task.current_step],
                         ))
                         
 
@@ -634,12 +779,7 @@ class StepEngine:
                     target_agent = world.agents.get(target_id)
                     if target_agent is not None:
                         target_role = int(target_agent.role)
-                
 
-                meeting_tick_start = None
-
-
-                
                 events.append(comm_action_event(
                     tick=world.tick,
                     sender_id=agent_id,
@@ -756,7 +896,8 @@ class StepEngine:
         ejected_id = None
         confidence_threshold = self.config.voting_confidence_threshold
         max_voting_score = 0.0
-        
+        eligible_candidates: list[int] = []
+
         if suspicion_scores is not None:
             alive_agent_ids = [a.agent_id for a in world.alive_agents()]
             
@@ -867,11 +1008,24 @@ class StepEngine:
                 "target_role": target_role,
             })
         
+        # Full audit trail for the ejection mechanism — suspicion scores are
+        # environment-internal; without this event they are a black box to analysis.
+        events.append(vote_resolution_event(
+            tick=world.tick,
+            suspicion_scores=suspicion_scores or {},
+            accuse_counts=accuse_counts,
+            eligible_candidates=eligible_candidates,
+            has_coordination=has_coordination,
+            voting_noise=voting_noise,
+            ejected_id=ejected_id,
+        ))
+
         events.append(meeting_summary_event(
             tick=world.tick,
             meeting_tick_start=world.meeting.tick_start,
             reporter_id=world.meeting.reporter_id,
             body_room=world.meeting.body_location,
+            body_agent_id=world.meeting.body_agent_id,
             comm_actions=comm_actions_summary,
             votes={k: v for k, v in world.meeting.votes.items()},
             ejected_id=ejected_id,

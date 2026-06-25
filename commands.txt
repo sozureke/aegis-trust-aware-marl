@@ -1,0 +1,10 @@
+python -m aegis.analysis.evaluate_ppo checkpoints/e3_trust_comm/seed_116740/E3_trust_comm/ppo_final.pt \
+  -c aegis/train/configs/e3_trust_comm.config.yaml \
+  -r -n 5 -d 0.3
+
+
+python -m aegis.scripts.run_experiments e4_delay_immediate.config.yaml  --max-seeds 30
+
+python -m aegis.analysis.merge_events checkpoints/e4_delay_immediate
+
+python -m aegis.analysis.analyze_events checkpoints/e4_delay_immediate/events_all.jsonl --summary

@@ -45,6 +45,7 @@ class AegisEnv(ParallelEnv):
         log_events: bool = False,
         log_path: Optional[str] = None,
         log_event_types: Optional[list[str]] = None,
+        log_pose: bool = True,
     ):
         super().__init__()
         
@@ -52,6 +53,7 @@ class AegisEnv(ParallelEnv):
         self.render_mode = render_mode
         self.log_events = log_events
         self.log_event_types = set(log_event_types) if log_event_types else None
+        self.log_pose = log_pose
         
         self.engine = StepEngine(self.config)
         
@@ -144,6 +146,13 @@ class AegisEnv(ParallelEnv):
         
         if self.event_writer:
             for event in init_events:
+                if not self.log_pose and event.event_type in (
+                    EventType.POSE,
+                    EventType.ROOM_ENTER,
+                    EventType.ROOM_EXIT,
+                    EventType.MOVE_BLOCKED,
+                ):
+                    continue
                 if self._should_log_event(event):
                     self.event_writer.write(event)
         
@@ -153,7 +162,11 @@ class AegisEnv(ParallelEnv):
         for agent_name in self.agents:
             agent_id = self._name_to_agent_id(agent_name)
             observations[agent_name] = self.obs_builder.build(self.world, agent_id)
-            infos[agent_name] = {"role": int(self.world.agents[agent_id].role)}
+            infos[agent_name] = {
+                "tick": int(self.world.tick),
+                "env_step": int(self.world.tick),
+                "role": int(self.world.agents[agent_id].role),
+            }
         
         return observations, infos
     
@@ -206,6 +219,13 @@ class AegisEnv(ParallelEnv):
         
         if self.event_writer:
             for event in events:
+                if not self.log_pose and event.event_type in (
+                    EventType.POSE,
+                    EventType.ROOM_ENTER,
+                    EventType.ROOM_EXIT,
+                    EventType.MOVE_BLOCKED,
+                ):
+                    continue
                 if self._should_log_event(event):
                     self.event_writer.write(event)
         
@@ -246,6 +266,8 @@ class AegisEnv(ParallelEnv):
             agent_event_info = agent_events.get(agent_name, {})
             
             infos[agent_name] = {
+                "tick": int(next_world.tick),
+                "env_step": int(next_world.tick),
                 "role": int(agent.role),
                 "alive": agent.alive,
                 "winner": authoritative_winner,
@@ -550,10 +572,9 @@ class AegisEnv(ParallelEnv):
                             continue
                         if not agent.alive:
                             continue
-                        if agent.room == kill_room:
-                            dist = self.engine.get_graph_distance(old_world, agent.room, kill_room)
-                            if dist <= self.config.vision_radius:
-                                witnesses.append(agent_id)
+                        dist = self.engine.get_graph_distance(old_world, agent.room, kill_room)
+                        if dist <= self.config.vision_radius:
+                            witnesses.append(agent_id)
                     
                     if len(witnesses) > 0:
                         suspect_event = SuspectEvent(
@@ -867,7 +888,10 @@ class AegisEnv(ParallelEnv):
 
         if self.log_event_types is None:
             return True
-        
+
+        # Always persist ground-truth roles for replay, even under log_event_types filters.
+        if event.event_type == EventType.ROLE_ASSIGNMENT:
+            return True
 
         return event.event_type.value in self.log_event_types
     

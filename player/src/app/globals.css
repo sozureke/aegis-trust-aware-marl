@@ -77,7 +77,6 @@
   }
   .dark {
 
-    /* Near-black schematic UI; gray accents */
     --background: oklch(0.09 0 0);
 
     --foreground: oklch(0.93 0 0);

@@ -3,8 +3,36 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import List, Optional
+
+import yaml
 
 from aegis.train.seeds import SEEDS, SEEDS_TEST
+
+
+def load_config_seed_overrides(config_path: Path) -> Optional[List[int]]:
+    """If the YAML defines `experiment.seeds`, use that list for this config only."""
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except OSError:
+        return None
+    exp = data.get("experiment") or {}
+    raw = exp.get("seeds")
+    if not raw or not isinstance(raw, list):
+        return None
+    return [int(s) for s in raw]
+
+
+def resolve_seeds(
+    overrides: Optional[List[int]],
+    default_seeds: List[int],
+    max_seeds: Optional[int],
+) -> List[int]:
+    out = list(overrides) if overrides is not None else list(default_seeds)
+    if max_seeds is not None:
+        out = out[:max_seeds]
+    return out
 
 
 def run_experiment(config_path: str, seed: int, dry_run: bool = False):
@@ -72,6 +100,9 @@ Examples:
 
   # Dry run (show commands without executing)
   python -m aegis.scripts.run_experiments e1_baseline.config.yaml --dry-run
+
+  # If a config YAML contains `experiment: { seeds: [1, 2] }`, those seeds are used
+  # for that file instead of the global SEEDS list (--test is ignored for that config).
         """
     )
     
@@ -102,13 +133,17 @@ Examples:
     args = parser.parse_args()
     configs_dir = Path(__file__).parent.parent / "train" / "configs"
     
-    seeds = SEEDS_TEST if args.test else SEEDS
-    if args.max_seeds:
-        seeds = seeds[:args.max_seeds]
-    
-    print(f"Using {len(seeds)} seeds: {seeds[:5]}..." if len(seeds) > 5 else f"Using {len(seeds)} seeds: {seeds}")
+    default_seeds = SEEDS_TEST if args.test else SEEDS
+
     print(f"Running {len(args.configs)} experiment(s): {', '.join(args.configs)}")
-    print(f"Total runs: {len(args.configs) * len(seeds)}")
+    total_runs = 0
+    for config_name in args.configs:
+        config_path = configs_dir / config_name
+        if not config_path.exists():
+            continue
+        ov = load_config_seed_overrides(config_path)
+        total_runs += len(resolve_seeds(ov, default_seeds, args.max_seeds))
+    print(f"Total runs: {total_runs}")
     
     if args.dry_run:
         print("\n[DRY RUN MODE - No experiments will be executed]\n")
@@ -120,7 +155,15 @@ Examples:
         if not config_path.exists():
             print(f"Configuration not found: {config_path}")
             continue
-        
+
+        overrides = load_config_seed_overrides(config_path)
+        seeds = resolve_seeds(overrides, default_seeds, args.max_seeds)
+        if overrides is not None:
+            print(f"\n{config_name}: using experiment.seeds from YAML ({len(seeds)} run(s)): {seeds}")
+        else:
+            preview = f"{seeds[:5]}..." if len(seeds) > 5 else str(seeds)
+            print(f"\n{config_name}: using default seed pool ({len(seeds)} run(s)): {preview}")
+
         for seed in seeds:
             success = run_experiment(str(config_path), seed, dry_run=args.dry_run)
             results.append((config_name, seed, success))

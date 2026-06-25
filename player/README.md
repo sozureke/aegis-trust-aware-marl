@@ -1,5 +1,11 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## AEGIS replay + OpenRouter
+
+1. Copy `player/.env.example` to `player/.env.local` and set `OPENROUTER_API_KEY` (from [OpenRouter](https://openrouter.ai/keys)).
+2. Optional: `OPENROUTER_MODEL` (default `anthropic/claude-3.5-haiku`).
+3. Run `yarn dev`, load an `events.jsonl`: for each episode the player **pregenerates** English **meeting chat** lines via OpenRouter (fallback shows symbolic text until requests finish). During meeting/voting, use **Meeting chat**; raw token/comm HUD streams are hidden while chat data exists.
+
 ## Getting Started
 
 First, run the development server:

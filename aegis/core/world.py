@@ -86,7 +86,9 @@ class AgentState:
     tasks: list[TaskState] = field(default_factory=list)
     target_room: Optional[int] = None
     path: list[int] = field(default_factory=list)
-    
+    pose_x: float = 0.5
+    pose_y: float = 0.5
+    pose_theta: float = 0.0
 
     has_voted: bool = False
     vote_target: Optional[int] = None
@@ -166,21 +168,38 @@ class WorldState:
         return [a for a in self.agents.values() if a.alive and a.role == Role.IMPOSTOR]
     
     def team_task_progress(self) -> int:
-        """Return total completed task steps across all survivors."""
-        return sum(a.completed_task_steps() for a in self.agents.values() if a.role == Role.SURVIVOR)
-    
+        """Return total completed task steps across alive survivors only.
+
+        Dead survivors are excluded: their incomplete tasks can never be
+        finished, so counting them would permanently block the task-win path.
+        """
+        return sum(
+            a.completed_task_steps()
+            for a in self.agents.values()
+            if a.role == Role.SURVIVOR and a.alive
+        )
+
     def total_task_steps(self) -> int:
-        """Return total task steps needed for all survivors."""
+        """Return total task steps required from alive survivors only.
+
+        Mirrors team_task_progress(): only living agents' tasks count toward
+        the completion target.
+        """
         total = 0
         for a in self.agents.values():
-            if a.role == Role.SURVIVOR:
+            if a.role == Role.SURVIVOR and a.alive:
                 for t in a.tasks:
                     total += t.total_steps()
         return total
-    
+
     def all_tasks_complete(self) -> bool:
-        """Check if all survivor tasks are complete."""
-        return self.team_task_progress() >= self.total_task_steps()
+        """Check if all alive survivors have completed their tasks."""
+        steps = self.total_task_steps()
+        # If no alive survivors have any tasks, treat as incomplete to avoid
+        # spurious evac activation (game-over conditions fire first anyway).
+        if steps == 0:
+            return False
+        return self.team_task_progress() >= steps
     
     def copy(self) ->  "WorldState":
         """Return a deep copy of this state."""

@@ -5,6 +5,7 @@ from gymnasium import spaces
 import numpy as np
 
 from aegis.core.rules import GameConfig
+from aegis.comms.actions import CommVocab
 
 
 class ObservationSpaces:
@@ -16,7 +17,7 @@ class ObservationSpaces:
         self.num_edges = num_edges
         self.num_agents = config.num_agents
         self.num_tokens = 20
-        self.num_comm_actions = 17
+        self.num_comm_actions = CommVocab.VOCAB_SIZE
         self.max_bodies = config.num_agents
         self.max_messages = 50
         self.max_tasks = config.tasks_per_survivor

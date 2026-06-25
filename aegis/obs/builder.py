@@ -233,36 +233,54 @@ class ObservationBuilder:
 
             for room in range(self.num_rooms):
                 mask[engine.offset_move + room] = 1
-            
+
 
             for token_id in range(self.num_tokens):
                 mask[engine.offset_token + token_id] = 1
-            
+
 
             if self.config.enable_trust_comm:
+                # Self-targeting ACCUSE/SUPPORT/QUESTION are semantically invalid:
+                # agents cannot meaningfully accuse or question themselves.
+                self_targeting = {
+                    CommVocab.SUPPORT_BASE + agent_id,
+                    CommVocab.ACCUSE_BASE + agent_id,
+                    CommVocab.QUESTION_BASE + agent_id,
+                }
+                # Guard: only mask IDs that are actually within the vocab range.
+                self_targeting = {c for c in self_targeting if c < CommVocab.VOCAB_SIZE}
                 for comm_id in range(self.num_comm_actions):
-                    mask[engine.offset_comm + comm_id] = 1
-        
+                    if comm_id not in self_targeting:
+                        mask[engine.offset_comm + comm_id] = 1
+
         elif world.phase == Phase.VOTING:
 
             for room in range(self.num_rooms):
                 mask[engine.offset_move + room] = 1
-            
+
 
             if not agent.has_voted:
                 for other_id, other in world.agents.items():
                     if other.alive:
                         mask[engine.offset_vote + other_id] = 1
                 mask[engine.offset_vote_skip] = 1
-            
+
 
             for token_id in range(self.num_tokens):
                 mask[engine.offset_token + token_id] = 1
-            
+
 
             if self.config.enable_trust_comm:
+                self_targeting = {
+                    CommVocab.SUPPORT_BASE + agent_id,
+                    CommVocab.ACCUSE_BASE + agent_id,
+                    CommVocab.QUESTION_BASE + agent_id,
+                }
+                # Guard: only mask IDs that are actually within the vocab range.
+                self_targeting = {c for c in self_targeting if c < CommVocab.VOCAB_SIZE}
                 for comm_id in range(self.num_comm_actions):
-                    mask[engine.offset_comm + comm_id] = 1
+                    if comm_id not in self_targeting:
+                        mask[engine.offset_comm + comm_id] = 1
         
 
         if mask.sum() == 0:

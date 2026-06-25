@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import time
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, fields, replace, asdict
 from typing import Optional
 
 import numpy as np
@@ -16,6 +16,7 @@ from torch.distributions import Categorical
 
 from aegis.core.rules import GameConfig
 from aegis.env.pettingzoo_env import AegisEnv
+from aegis.logging.rl_log import RlJsonlWriter, flatten_obs_hash
 
 
 @dataclass
@@ -171,7 +172,10 @@ class Args:
     log_events: bool = False
     event_log_path: Optional[str] = None
     log_event_types: Optional[list[str]] = None
-    experiment_name: Optional[str] = None  
+    log_pose: bool = True
+    rl_log_path: Optional[str] = None
+    log_rl_transitions: bool = False
+    run_id: Optional[str] = None
 
     game_config: Optional[dict] = None
     role_rewards: Optional[RoleRewards] = None
@@ -307,6 +311,10 @@ class Args:
             log_events=logging_cfg.get("log_events", False),
             event_log_path=logging_cfg.get("event_log_path", None),
             log_event_types=logging_cfg.get("log_event_types", None),
+            log_pose=logging_cfg.get("log_pose", True),
+            rl_log_path=logging_cfg.get("rl_log_path", None),
+            log_rl_transitions=logging_cfg.get("log_rl_transitions", False),
+            run_id=logging_cfg.get("run_id", None),
             game_config=game_config,
             role_rewards=role_rewards,
         )   
@@ -827,6 +835,23 @@ def compute_role_shaped_rewards(
     return shaped_rewards, breakdowns
 
 
+def _episode_meta_record(
+    env: AegisEnv,
+    episode_id: int,
+    anchor_global_step: int,
+    run_id: Optional[str],
+) -> dict:
+    cfg = env.config
+    return {
+        "event_type": "episode_meta",
+        "episode_id": episode_id,
+        "anchor_global_step": anchor_global_step,
+        "seed": cfg.seed,
+        "run_id": run_id,
+        "env_config": asdict(cfg),
+    }
+
+
 def collect_rollout(
     env: AegisEnv,
     agent: ActorCritic,
@@ -835,6 +860,10 @@ def collect_rollout(
     device: str,
     role_rewards: Optional[RoleRewards] = None,
     debug_rewards: bool = False,
+    rl_writer: Optional[RlJsonlWriter] = None,
+    rl_episode: Optional[dict] = None,
+    global_step_base: int = 0,
+    run_id: Optional[str] = None,
 ) -> tuple[dict, list, torch.Tensor, list]:
     agent_names = env.possible_agents
     num_agents = len(agent_names)
@@ -846,6 +875,10 @@ def collect_rollout(
     all_episode_stats = []
     
     last_dones = torch.zeros(num_agents, dtype=torch.float32, device=device)
+
+    if rl_writer is not None and rl_episode is not None and not rl_episode.get("_begin_written", False):
+        rl_writer.write_record(_episode_meta_record(env, rl_episode["id"], global_step_base, run_id))
+        rl_episode["_begin_written"] = True
     
     for step in range(buffer.num_steps):
         obs_flat = []
@@ -871,7 +904,7 @@ def collect_rollout(
         if hasattr(env,  'engine') and hasattr(env.engine,  'offset_comm'):
             for name in agent_names:
                 action = actions_dict[name]
-                if env.engine.offset_comm <= action < env.engine.offset_comm + 17:
+                if env.engine.offset_comm <= action < env.engine.offset_vote:
                     comm_action_count += 1
         
         next_obs_dict, rewards_dict, terminations, truncations, infos = env.step(actions_dict)
@@ -887,6 +920,33 @@ def collect_rollout(
             role_rewards=role_rewards,
             terminated=terminated,
         )
+
+        if rl_writer is not None:
+            for i, name in enumerate(agent_names):
+                flat = flatten_obs(obs_dict[name])
+                aid = int(name.split("_", 1)[1])
+                rl_writer.write_record(
+                    {
+                        "event_type": "rl_transition",
+                        "global_transition_id": int(global_step_base + step * num_agents + i),
+                        "rollout_step": step,
+                        "agent": name,
+                        "agent_id": aid,
+                        "action": int(actions[i].item()),
+                        "action_name": env.engine.describe_action(int(actions[i].item())),
+                        "reward_env": float(rewards_dict[name]),
+                        "reward_shaped": float(shaped_rewards[name]),
+                        "terminated": bool(terminations[name]),
+                        "truncated": bool(truncations[name]),
+                        "done": bool(terminations[name] or truncations[name]),
+                        "obs_hash": flatten_obs_hash(flat),
+                        "action_mask_sum": float(obs_dict[name]["action_mask"].sum()),
+                        "action_mask_n": int(obs_dict[name]["action_mask"].shape[0]),
+                        "value": float(values[i].item()),
+                        "logprob": float(logprobs[i].item()),
+                        "game_tick": int(infos[name].get("tick", -1)),
+                    }
+                )
         
         if debug_rewards and episode_stats is not None:
             for name in agent_names:
@@ -982,6 +1042,16 @@ def collect_rollout(
                 episode_stats = EpisodeRewardStats()
             
             obs_dict, _ = env.reset()
+            if rl_writer is not None and rl_episode is not None:
+                rl_episode["id"] += 1
+                rl_writer.write_record(
+                    _episode_meta_record(
+                        env,
+                        rl_episode["id"],
+                        global_step_base + (step + 1) * num_agents,
+                        run_id,
+                    )
+                )
             episode_rewards = {name: 0.0 for name in agent_names}
             episode_lengths = 0
             last_dones = torch.zeros(num_agents, dtype=torch.float32, device=device)
@@ -1196,6 +1266,7 @@ def make_env(args: Args) -> AegisEnv:
         log_events=args.log_events if args.log_events else False,
         log_path=log_path if args.log_events else None,
         log_event_types=args.log_event_types,
+        log_pose=args.log_pose,
     )
 
 
@@ -1338,6 +1409,18 @@ def train(args: Args):
     
     obs_dict, _ = env.reset()
     
+    rl_writer = None
+    rl_episode_state = None
+    run_id_resolved = args.run_id or (
+        f"{args.experiment_name}_{args.seed}" if args.experiment_name else str(args.seed)
+    )
+    if getattr(args, "log_rl_transitions", False):
+        rlp = args.rl_log_path or os.path.join(experiment_dir, "rl_transitions.jsonl")
+        if os.path.dirname(rlp):
+            os.makedirs(os.path.dirname(rlp), exist_ok=True)
+        rl_writer = RlJsonlWriter(rlp)
+        rl_episode_state = {"id": 0}
+        print(f"RL transition log: {rlp} (run_id={run_id_resolved})")
 
     log_file_path = os.path.join(experiment_dir,  "training_log.json")
     log_file = open(log_file_path,  "w")
@@ -1356,7 +1439,17 @@ def train(args: Args):
         while global_step < args.total_timesteps:
             buffer.reset()
             obs_dict, completed_episodes, last_dones, episode_debug_stats = collect_rollout(
-                env, agent, buffer, obs_dict, args.device, args.role_rewards, args.debug_rewards
+                env,
+                agent,
+                buffer,
+                obs_dict,
+                args.device,
+                args.role_rewards,
+                args.debug_rewards,
+                rl_writer=rl_writer,
+                rl_episode=rl_episode_state,
+                global_step_base=global_step,
+                run_id=run_id_resolved,
             )
             
             global_step += batch_size
@@ -1578,6 +1671,8 @@ def train(args: Args):
     finally:
         log_file.close()
         print(f"Training log saved to {log_file_path}")
+        if rl_writer is not None:
+            rl_writer.close()
     
     final_path = os.path.join(experiment_dir,  "ppo_final.pt")
     torch.save({
